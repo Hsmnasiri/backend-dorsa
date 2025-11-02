@@ -31,6 +31,9 @@ if [[ -z "${AWS_BUCKET_NAME}" ]]; then
   exit 1
 fi
 
+# macOS ships with Bash 3.2 by default, so avoid `${var,,}` expansion.
+ENABLE_PUBLIC_READ_NORMALIZED=$(printf '%s' "${ENABLE_PUBLIC_READ}" | tr '[:upper:]' '[:lower:]')
+
 AWS_ARGS=( "--region" "${AWS_REGION}" )
 if [[ -n "${AWS_PROFILE}" ]]; then
   AWS_ARGS+=( "--profile" "${AWS_PROFILE}" )
@@ -58,7 +61,7 @@ else
   fi
 fi
 
-if [[ "${ENABLE_PUBLIC_READ,,}" == "true" ]]; then
+if [[ "${ENABLE_PUBLIC_READ_NORMALIZED}" == "true" ]]; then
   echo "Ensuring bucket allows public read (required for direct image URLs)."
   aws_cmd s3api put-public-access-block \
     --bucket "${AWS_BUCKET_NAME}" \
