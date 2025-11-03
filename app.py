@@ -36,8 +36,8 @@ from api.ml_predict import predict_calories
 from api.ml_service import MLServiceError, call_ml_service
 
 BASE_DIR = Path(__file__).resolve().parent
-UPLOADS_DIR = BASE_DIR / "uploads"
-DB_PATH = BASE_DIR / "food_history.db"
+UPLOADS_DIR = Path(os.environ.get("UPLOADS_DIR", str(BASE_DIR / "uploads"))).resolve()
+DB_PATH = Path(os.environ.get("SQLITE_DB_PATH", str(BASE_DIR / "food_history.db"))).resolve()
 
 load_dotenv(BASE_DIR.parent / ".env")
 
@@ -77,7 +77,10 @@ def _build_dynamo_table(table_name: str):
 def _upload_to_s3(s3_client, bucket: str, file_stream: io.BytesIO, filename: str) -> str:
   """Upload the bytes to S3 and return the public URL."""
   file_stream.seek(0)
-  extra_args = {"ContentType": "image/jpeg", "ACL": "public-read"}
+  extra_args = {"ContentType": "image/jpeg"}
+  acl = os.environ.get("AWS_S3_ACL", "public-read").strip()
+  if acl:
+    extra_args["ACL"] = acl
   s3_client.upload_fileobj(file_stream, bucket, filename, ExtraArgs=extra_args)
   return f"https://{bucket}.s3.amazonaws.com/{filename}"
 
@@ -164,6 +167,7 @@ def _from_dynamo(value: Any) -> Any:
 
 def _get_db_connection() -> sqlite3.Connection:
   """Return a SQLite connection with row access by name."""
+  DB_PATH.parent.mkdir(parents=True, exist_ok=True)
   conn = sqlite3.connect(DB_PATH)
   conn.row_factory = sqlite3.Row
   return conn

@@ -5,6 +5,7 @@
   "AWS_BUCKET_NAME": "food-log-uploads-example",
   "AWS_DYNAMODB_TABLE": "FoodLogHistory",
   "AWS_USERS_TABLE": "FoodLogUsers",
+  "AWS_S3_ACL": "public-read",
   "ML_SERVICE_URL": "stub",
   "ML_SERVICE_API_KEY": "replace-with-real-api-key",
   "JWT_SECRET_KEY": "generate-a-long-random-string",
