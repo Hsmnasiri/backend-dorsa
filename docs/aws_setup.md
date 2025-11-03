@@ -68,7 +68,7 @@ export AWS_S3_ACL=public-read      # Set to empty if ACLs are disabled
 export ML_SERVICE_URL=stub  # Replace with real endpoint when ready
 export ML_SERVICE_API_KEY=replaceme
 export JWT_SECRET_KEY=$(openssl rand -hex 32)
-gunicorn -b 0.0.0.0:5000 app:create_app()
+gunicorn -b 0.0.0.0:5000 app:create_app
 ```
 
 Hit `/health` and `/history` to ensure the app can talk to AWS. The first call to `/predict` will verify S3 uploads and DynamoDB writes.
