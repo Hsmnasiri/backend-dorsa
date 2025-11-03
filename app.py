@@ -190,6 +190,7 @@ def _initialise_sqlite() -> None:
         inference_source TEXT,
         ml_service_error TEXT,
         created_at TEXT NOT NULL,
+        consumed_at TEXT NOT NULL,
         user_id TEXT
       )
       """
@@ -200,6 +201,19 @@ def _initialise_sqlite() -> None:
       conn.execute("ALTER TABLE food_history ADD COLUMN user_id TEXT")
     except sqlite3.OperationalError:
       pass
+    try:
+      conn.execute(
+        "ALTER TABLE food_history ADD COLUMN consumed_at TEXT NOT NULL DEFAULT ''"
+      )
+    except sqlite3.OperationalError:
+      pass
+    conn.execute(
+      """
+      UPDATE food_history
+      SET consumed_at = created_at
+      WHERE consumed_at IS NULL OR consumed_at = ''
+      """
+    )
     conn.execute(
       """
       CREATE TABLE IF NOT EXISTS users (
@@ -221,9 +235,9 @@ def _persist_sqlite(record: Dict[str, Any]) -> None:
       """
       INSERT INTO food_history (
         id, user_id, image_url, food, calories, ingredients, nutrition_facts,
-        metadata, inference_source, ml_service_error, created_at
+        metadata, inference_source, ml_service_error, created_at, consumed_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       """,
       (
         record["id"],
@@ -237,6 +251,7 @@ def _persist_sqlite(record: Dict[str, Any]) -> None:
         record["inference_source"],
         record["ml_service_error"],
         record["created_at"],
+        record["consumed_at"],
       ),
     )
   conn.close()
@@ -248,7 +263,7 @@ def _fetch_sqlite_history(user_id: str | None = None) -> List[Dict[str, Any]]:
   sql = (
     """
     SELECT id, user_id, image_url, food, calories, ingredients, nutrition_facts,
-           metadata, inference_source, ml_service_error, created_at
+           metadata, inference_source, ml_service_error, created_at, consumed_at
     FROM food_history
     """
   )
@@ -256,7 +271,7 @@ def _fetch_sqlite_history(user_id: str | None = None) -> List[Dict[str, Any]]:
   if user_id:
     sql += " WHERE user_id = ?"
     params = (user_id,)
-  sql += " ORDER BY datetime(created_at) DESC"
+  sql += " ORDER BY datetime(consumed_at) DESC, datetime(created_at) DESC"
 
   rows = conn.execute(sql, params).fetchall()
   conn.close()
@@ -276,6 +291,7 @@ def _fetch_sqlite_history(user_id: str | None = None) -> List[Dict[str, Any]]:
         "inference_source": row["inference_source"],
         "ml_service_error": row["ml_service_error"],
         "created_at": row["created_at"],
+        "consumed_at": row["consumed_at"] or row["created_at"],
       }
     )
   return history
@@ -372,6 +388,32 @@ def create_app() -> Flask:
     except InvalidTokenError:
       _unauthorized("Token is invalid.")
     return None
+
+  def _resolve_consumed_at(raw_value: str | None, default_iso: str) -> str:
+    if not raw_value:
+      return default_iso
+    cleaned = raw_value.strip()
+    if not cleaned:
+      return default_iso
+
+    try:
+      parsed = datetime.fromisoformat(cleaned)
+    except ValueError:
+      parsed = None
+
+    if parsed is None:
+      try:
+        parsed_date = datetime.strptime(cleaned, "%Y-%m-%d").date()
+        parsed = datetime.combine(parsed_date, datetime.min.time())
+      except ValueError:
+        app.logger.warning("Invalid meal_date provided; falling back to created_at: %s", cleaned)
+        return default_iso
+
+    if parsed.tzinfo is None:
+      parsed = parsed.replace(tzinfo=timezone.utc)
+    else:
+      parsed = parsed.astimezone(timezone.utc)
+    return parsed.isoformat()
 
   if USE_AWS_BACKEND:
     s3_bucket = os.environ.get("AWS_BUCKET_NAME")
@@ -472,6 +514,7 @@ def create_app() -> Flask:
     if user_claims:
       user_id = user_claims.get("sub")
       metadata.setdefault("uploaded_by", user_claims.get("email"))
+    raw_consumed_at = request.form.get("meal_date") or request.form.get("consumed_at")
 
     if USE_AWS_BACKEND:
       try:
@@ -518,6 +561,8 @@ def create_app() -> Flask:
     food_name, calories, ingredients, nutrition = _normalise_prediction(raw_prediction)
 
     created_at = datetime.now(timezone.utc).isoformat()
+    consumed_at = _resolve_consumed_at(raw_consumed_at, created_at)
+    metadata.setdefault("meal_date", consumed_at)
     record = {
       "id": uuid.uuid4().hex,
       "user_id": user_id,
@@ -530,6 +575,7 @@ def create_app() -> Flask:
       "inference_source": inference_source,
       "ml_service_error": ml_error,
       "created_at": created_at,
+      "consumed_at": consumed_at,
     }
 
     if USE_AWS_BACKEND:
@@ -555,6 +601,7 @@ def create_app() -> Flask:
       "metadata": metadata,
       "timestamp": created_at,
       "inference_source": inference_source,
+      "consumed_at": consumed_at,
     }
     if user_id:
       payload["user_id"] = user_id
@@ -628,7 +675,15 @@ def create_app() -> Flask:
       items = [_from_dynamo(item) for item in response.get("Items", [])]
       if user_id:
         items = [entry for entry in items if entry.get("user_id") == user_id]
-      items.sort(key=lambda entry: entry.get("created_at", ""), reverse=True)
+      for entry in items:
+        entry.setdefault("consumed_at", entry.get("created_at"))
+      items.sort(
+        key=lambda entry: (
+          entry.get("consumed_at") or entry.get("created_at") or "",
+          entry.get("created_at") or "",
+        ),
+        reverse=True,
+      )
     else:
       # Already filtered in SQL when user_id provided.
       items = _fetch_sqlite_history(user_id=user_id)

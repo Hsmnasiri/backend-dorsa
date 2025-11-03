@@ -21,6 +21,8 @@ paths:
       tags: [Predictions]
       summary: Upload a meal photo and receive nutrition predictions
       operationId: uploadMealPhoto
+      security:
+        - bearerAuth: []
       requestBody:
         required: true
         content:
@@ -32,6 +34,12 @@ paths:
                   type: string
                   format: binary
                   description: Image file of the meal. The field may also be named `image`.
+                meal_date:
+                  type: string
+                  format: date-time
+                  description: >
+                    Optional ISO-8601 timestamp (or yyyy-mm-dd date) representing when the meal was
+                    consumed. Defaults to the upload time if omitted.
               required:
                 - photo
       responses:
@@ -43,6 +51,12 @@ paths:
                 $ref: "#/components/schemas/PredictionResponse"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          description: Missing or invalid token (optional token accepted but invalid tokens are rejected)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "500":
           $ref: "#/components/responses/ServerError"
   /auth/signup:
@@ -131,6 +145,8 @@ paths:
       tags: [History]
       summary: List stored meal predictions
       operationId: listHistory
+      security:
+        - bearerAuth: []
       responses:
         "200":
           description: History retrieved
@@ -143,6 +159,16 @@ paths:
                     type: array
                     items:
                       $ref: "#/components/schemas/StoredMeal"
+                  message:
+                    type: string
+                    description: Present only when the history is empty.
+                    example: history empty
+        "401":
+          description: Missing or invalid token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
   /health:
     get:
       tags: [Health]
@@ -224,6 +250,10 @@ components:
         timestamp:
           type: string
           format: date-time
+        consumed_at:
+          type: string
+          format: date-time
+          description: Timestamp representing when the meal was consumed.
         inference_source:
           type: string
           description: Indicates whether the ML service or local fallback produced the result.
@@ -238,6 +268,9 @@ components:
             id:
               type: string
               description: Unique identifier for the stored record.
+            user_id:
+              type: string
+              description: Identifier of the user that created the record.
     NutritionFacts:
       type: object
       properties:
