@@ -240,11 +240,9 @@ components:
           example: 420
         ingredients:
           type: array
-          nullable: true
           items:
             type: string
         nutrition_facts:
-          nullable: true
           $ref: "#/components/schemas/NutritionFacts"
         metadata:
           type: object
@@ -252,10 +250,6 @@ components:
         timestamp:
           type: string
           format: date-time
-        created_at:
-          type: string
-          format: date-time
-          description: Timestamp representing when the record was created.
         consumed_at:
           type: string
           format: date-time
