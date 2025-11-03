@@ -19,6 +19,7 @@ Environment variables Render uses (from `render.yaml`):
 - `ML_SERVICE_URL=stub` while the real ML service is unavailable.
 - `ML_SERVICE_API_KEY` (leave empty unless needed).
 - `JWT_SECRET_KEY` – set this in the Render dashboard (use `openssl rand -hex 32` locally to generate a strong value).
+- TensorFlow and the training utilities are optional; runtime predictions now use synthetic data so the container no longer ships heavy ML dependencies. If you need to retrain models locally, install `tensorflow` manually before running `train_model.py`.
 
 ## 3. Deploy via Render Blueprint
 1. Push your latest changes to the default branch.
