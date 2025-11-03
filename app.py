@@ -389,31 +389,105 @@ def create_app() -> Flask:
       _unauthorized("Token is invalid.")
     return None
 
-  def _resolve_consumed_at(raw_value: str | None, default_iso: str) -> str:
-    if not raw_value:
-      return default_iso
-    cleaned = raw_value.strip()
-    if not cleaned:
-      return default_iso
+def _resolve_consumed_at(raw_value: str | None, default_iso: str) -> str:
+  if not raw_value:
+    return default_iso
+  parsed = _parse_client_datetime(raw_value)
+  if parsed is None:
+    app.logger.warning("Invalid meal_date provided; falling back to created_at: %s", raw_value)
+    return default_iso
+  return _format_iso_timestamp(parsed)
 
+
+def _normalise_iso_string(value: Any) -> str | None:
+  if value is None:
+    return None
+  if isinstance(value, datetime):
+    return _format_iso_timestamp(value)
+  parsed = _parse_client_datetime(str(value))
+  if parsed is None:
+    return None
+  return _format_iso_timestamp(parsed)
+
+
+def _history_sort_key(entry: Dict[str, Any]) -> Tuple[datetime, datetime, str]:
+  fallback = datetime.min.replace(tzinfo=timezone.utc)
+  consumed = _parse_client_datetime(entry.get("consumed_at") or entry.get("created_at") or "")
+  if consumed is None:
+    consumed = fallback
+  created = _parse_client_datetime(entry.get("created_at") or "")
+  if created is None:
+    created = consumed
+  return (consumed, created, entry.get("id") or "")
+
+
+def _normalise_history_item(item: Dict[str, Any]) -> Dict[str, Any]:
+  normalised = dict(item)
+
+  metadata_raw = normalised.get("metadata")
+  metadata_obj = metadata_raw
+  if isinstance(metadata_obj, str):
     try:
-      parsed = datetime.fromisoformat(cleaned)
+      metadata_obj = json.loads(metadata_obj)
     except ValueError:
-      parsed = None
+      metadata_obj = {}
+  if not isinstance(metadata_obj, dict):
+    metadata_obj = {}
 
-    if parsed is None:
-      try:
-        parsed_date = datetime.strptime(cleaned, "%Y-%m-%d").date()
-        parsed = datetime.combine(parsed_date, datetime.min.time())
-      except ValueError:
-        app.logger.warning("Invalid meal_date provided; falling back to created_at: %s", cleaned)
-        return default_iso
+  created_iso = _normalise_iso_string(normalised.get("created_at"))
+  if created_iso:
+    normalised["created_at"] = created_iso
+  else:
+    normalised.pop("created_at", None)
 
-    if parsed.tzinfo is None:
-      parsed = parsed.replace(tzinfo=timezone.utc)
+  consumed_iso = _normalise_iso_string(
+    normalised.get("consumed_at") or metadata_obj.get("meal_date")
+  )
+  if consumed_iso:
+    normalised["consumed_at"] = consumed_iso
+  elif created_iso:
+    normalised["consumed_at"] = created_iso
+  else:
+    normalised.pop("consumed_at", None)
+
+  meal_iso = _normalise_iso_string(metadata_obj.get("meal_date"))
+  if meal_iso:
+    metadata_obj["meal_date"] = meal_iso
+  elif "meal_date" in metadata_obj:
+    metadata_obj.pop("meal_date")
+  normalised["metadata"] = metadata_obj
+
+  if normalised.get("nutrition_facts") is None:
+    normalised.pop("nutrition_facts", None)
+  elif isinstance(normalised.get("nutrition_facts"), str):
+    try:
+      parsed_nf = json.loads(normalised["nutrition_facts"])
+    except ValueError:
+      parsed_nf = None
+    if isinstance(parsed_nf, dict):
+      normalised["nutrition_facts"] = parsed_nf
     else:
-      parsed = parsed.astimezone(timezone.utc)
-    return parsed.isoformat()
+      normalised.pop("nutrition_facts", None)
+  if normalised.get("ingredients") is None:
+    normalised.pop("ingredients", None)
+  elif isinstance(normalised.get("ingredients"), str):
+    try:
+      parsed_ing = json.loads(normalised["ingredients"])
+    except ValueError:
+      parsed_ing = None
+    if isinstance(parsed_ing, list):
+      normalised["ingredients"] = parsed_ing
+    else:
+      normalised.pop("ingredients", None)
+  if not normalised.get("image_url"):
+    normalised.pop("image_url", None)
+  if not normalised.get("inference_source"):
+    normalised.pop("inference_source", None)
+  if not normalised.get("user_id"):
+    normalised.pop("user_id", None)
+  normalised.pop("timestamp", None)
+
+  return normalised
 
   if USE_AWS_BACKEND:
     s3_bucket = os.environ.get("AWS_BUCKET_NAME")
@@ -560,9 +634,10 @@ def create_app() -> Flask:
 
     food_name, calories, ingredients, nutrition = _normalise_prediction(raw_prediction)
 
-    created_at = datetime.now(timezone.utc).isoformat()
+    created_at_dt = datetime.now(timezone.utc)
+    created_at = _format_iso_timestamp(created_at_dt)
     consumed_at = _resolve_consumed_at(raw_consumed_at, created_at)
-    metadata.setdefault("meal_date", consumed_at)
+    metadata["meal_date"] = consumed_at
     record = {
       "id": uuid.uuid4().hex,
       "user_id": user_id,
@@ -600,6 +675,7 @@ def create_app() -> Flask:
       "nutrition_facts": nutrition,
       "metadata": metadata,
       "timestamp": created_at,
+      "created_at": created_at,
       "inference_source": inference_source,
       "consumed_at": consumed_at,
     }
@@ -676,14 +752,12 @@ def create_app() -> Flask:
       if user_id:
         items = [entry for entry in items if entry.get("user_id") == user_id]
       for entry in items:
-        entry.setdefault("consumed_at", entry.get("created_at"))
-      items.sort(
-        key=lambda entry: (
-          entry.get("consumed_at") or entry.get("created_at") or "",
-          entry.get("created_at") or "",
-        ),
-        reverse=True,
-      )
+        metadata_obj = entry.get("metadata")
+        meal_date = None
+        if isinstance(metadata_obj, dict):
+          meal_date = metadata_obj.get("meal_date")
+        entry.setdefault("consumed_at", meal_date or entry.get("created_at"))
+      items.sort(key=_history_sort_key, reverse=True)
     else:
       # Already filtered in SQL when user_id provided.
       items = _fetch_sqlite_history(user_id=user_id)
@@ -696,7 +770,7 @@ def create_app() -> Flask:
         continue
       if item_id:
         seen_ids.add(item_id)
-      unique_items.append(item)
+      unique_items.append(_normalise_history_item(item))
 
     if not unique_items:
       return {"items": [], "message": "history empty"}, 200
@@ -755,3 +829,36 @@ def create_app() -> Flask:
 if __name__ == "__main__":
   flask_app = create_app()
   flask_app.run(host="0.0.0.0", port=5000, debug=True)
+def _format_iso_timestamp(value: datetime) -> str:
+  """Return an ISO-8601 string with at most millisecond precision in UTC."""
+  value = value.astimezone(timezone.utc)
+  microseconds = value.microsecond
+  if microseconds == 0:
+    return value.isoformat(timespec="seconds")
+  milliseconds = microseconds // 1000
+  value = value.replace(microsecond=milliseconds * 1000)
+  if milliseconds == 0:
+    return value.isoformat(timespec="seconds")
+  return value.isoformat(timespec="milliseconds")
+
+
+def _parse_client_datetime(raw: str) -> datetime | None:
+  """Parse a client-supplied timestamp into an aware datetime in UTC."""
+  if not raw:
+    return None
+  cleaned = str(raw).strip()
+  if not cleaned:
+    return None
+  if cleaned.endswith("Z"):
+    cleaned = f"{cleaned[:-1]}+00:00"
+  try:
+    parsed = datetime.fromisoformat(cleaned)
+  except ValueError:
+    try:
+      date_only = datetime.strptime(cleaned, "%Y-%m-%d").date()
+    except ValueError:
+      return None
+    parsed = datetime.combine(date_only, datetime.min.time())
+  if parsed.tzinfo is None:
+    parsed = parsed.replace(tzinfo=timezone.utc)
+  return parsed.astimezone(timezone.utc)
