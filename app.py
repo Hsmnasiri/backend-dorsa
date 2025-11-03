@@ -24,7 +24,7 @@ from urllib.parse import urljoin
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
 from dotenv import load_dotenv
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, jsonify, request, send_from_directory, abort
 from flask_cors import CORS
 from werkzeug.security import check_password_hash, generate_password_hash
 
@@ -189,10 +189,17 @@ def _initialise_sqlite() -> None:
         metadata TEXT,
         inference_source TEXT,
         ml_service_error TEXT,
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        user_id TEXT
       )
       """
     )
+
+    # Add new columns when migrating from older schemas.
+    try:
+      conn.execute("ALTER TABLE food_history ADD COLUMN user_id TEXT")
+    except sqlite3.OperationalError:
+      pass
     conn.execute(
       """
       CREATE TABLE IF NOT EXISTS users (
@@ -213,13 +220,14 @@ def _persist_sqlite(record: Dict[str, Any]) -> None:
     conn.execute(
       """
       INSERT INTO food_history (
-        id, image_url, food, calories, ingredients, nutrition_facts,
+        id, user_id, image_url, food, calories, ingredients, nutrition_facts,
         metadata, inference_source, ml_service_error, created_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       """,
       (
         record["id"],
+        record.get("user_id"),
         record["image_url"],
         record["food"],
         record["calories"],
@@ -234,17 +242,23 @@ def _persist_sqlite(record: Dict[str, Any]) -> None:
   conn.close()
 
 
-def _fetch_sqlite_history() -> List[Dict[str, Any]]:
+def _fetch_sqlite_history(user_id: str | None = None) -> List[Dict[str, Any]]:
   """Return stored prediction history from SQLite."""
   conn = _get_db_connection()
-  rows = conn.execute(
+  sql = (
     """
-    SELECT id, image_url, food, calories, ingredients, nutrition_facts,
+    SELECT id, user_id, image_url, food, calories, ingredients, nutrition_facts,
            metadata, inference_source, ml_service_error, created_at
     FROM food_history
-    ORDER BY datetime(created_at) DESC
     """
-  ).fetchall()
+  )
+  params: tuple[Any, ...] = ()
+  if user_id:
+    sql += " WHERE user_id = ?"
+    params = (user_id,)
+  sql += " ORDER BY datetime(created_at) DESC"
+
+  rows = conn.execute(sql, params).fetchall()
   conn.close()
 
   history: List[Dict[str, Any]] = []
@@ -252,6 +266,7 @@ def _fetch_sqlite_history() -> List[Dict[str, Any]]:
     history.append(
       {
         "id": row["id"],
+        "user_id": row["user_id"],
         "image_url": row["image_url"],
         "food": row["food"],
         "calories": row["calories"],
@@ -331,6 +346,32 @@ def create_app() -> Flask:
 
   ml_service_url = os.environ.get("ML_SERVICE_URL", "").strip()
   ml_service_api_key = os.environ.get("ML_SERVICE_API_KEY", "").strip() or None
+
+  def _unauthorized(message: str) -> None:
+    response = jsonify({"error": message})
+    response.status_code = 401
+    abort(response)
+
+  def _get_request_user(optional: bool = True) -> Dict[str, Any] | None:
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header or not auth_header.startswith("Bearer "):
+      if optional:
+        return None
+      _unauthorized("Authorization header missing or invalid.")
+
+    token = auth_header.split(" ", 1)[1].strip()
+    if not token:
+      if optional:
+        return None
+      _unauthorized("Authorization header missing or invalid.")
+
+    try:
+      return _decode_jwt(token)
+    except ExpiredSignatureError:
+      _unauthorized("Token has expired.")
+    except InvalidTokenError:
+      _unauthorized("Token is invalid.")
+    return None
 
   if USE_AWS_BACKEND:
     s3_bucket = os.environ.get("AWS_BUCKET_NAME")
@@ -426,6 +467,11 @@ def create_app() -> Flask:
     unique_name = f"{uuid.uuid4().hex}{extension.lower()}"
 
     metadata = extract_metadata(binary_content) or {}
+    user_claims = _get_request_user(optional=True)
+    user_id = None
+    if user_claims:
+      user_id = user_claims.get("sub")
+      metadata.setdefault("uploaded_by", user_claims.get("email"))
 
     if USE_AWS_BACKEND:
       try:
@@ -474,6 +520,7 @@ def create_app() -> Flask:
     created_at = datetime.now(timezone.utc).isoformat()
     record = {
       "id": uuid.uuid4().hex,
+      "user_id": user_id,
       "image_url": image_url,
       "food": food_name,
       "calories": calories,
@@ -509,6 +556,8 @@ def create_app() -> Flask:
       "timestamp": created_at,
       "inference_source": inference_source,
     }
+    if user_id:
+      payload["user_id"] = user_id
     if ml_error:
       payload["ml_service_error"] = ml_error
 
@@ -565,6 +614,9 @@ def create_app() -> Flask:
   @app.route("/history", methods=["GET"])
   def history() -> Tuple[Dict[str, List[Dict[str, Any]]], int]:
     """Return stored prediction history ordered from newest to oldest."""
+    user_claims = _get_request_user(optional=False)
+    user_id = user_claims.get("sub") if user_claims else None
+
     if USE_AWS_BACKEND:
       try:
         assert dynamo_table is not None
@@ -574,11 +626,27 @@ def create_app() -> Flask:
         return {"error": "History fetch failed", "details": str(exc)}, 502
 
       items = [_from_dynamo(item) for item in response.get("Items", [])]
+      if user_id:
+        items = [entry for entry in items if entry.get("user_id") == user_id]
       items.sort(key=lambda entry: entry.get("created_at", ""), reverse=True)
     else:
-      items = _fetch_sqlite_history()
+      # Already filtered in SQL when user_id provided.
+      items = _fetch_sqlite_history(user_id=user_id)
 
-    return {"items": items}, 200
+    seen_ids = set()
+    unique_items: List[Dict[str, Any]] = []
+    for item in items:
+      item_id = item.get("id")
+      if item_id and item_id in seen_ids:
+        continue
+      if item_id:
+        seen_ids.add(item_id)
+      unique_items.append(item)
+
+    if not unique_items:
+      return {"items": [], "message": "history empty"}, 200
+
+    return {"items": unique_items}, 200
 
   @app.route("/auth/me", methods=["GET"])
   def session() -> Tuple[Dict[str, Any], int]:
